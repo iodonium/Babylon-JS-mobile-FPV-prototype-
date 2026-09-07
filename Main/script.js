@@ -1,0 +1,891 @@
+const GAME_CONFIG = {
+    gravityY: -8.7,          
+    jumpHeight: 0.6,         
+    lookSensitivityUser: 40, 
+    shootRange: 10,          
+    targetAimRange: 20,      
+    renderDistance: 35,      
+    moveSpeed: 0.05,         
+    qualityLevel: 2.50,      
+    guiScale: 1.5,             
+    healthPercentage: 99     
+};
+
+const STORAGE_KEY_MESHES = "game_mesh_states_v2";
+const STORAGE_KEY_SETTINGS = "game_settings_v2";
+
+function createFallbackIconDataURL(type) {
+    const cvs = document.createElement("canvas");
+    cvs.width = 128; cvs.height = 128;
+    const ctx = cvs.getContext("2d");
+    ctx.fillStyle = "transparent";
+    ctx.fillRect(0, 0, 128, 128);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 6;
+    ctx.lineCap = "round";
+
+    if (type === "hand") {
+        ctx.beginPath(); ctx.arc(64, 50, 28, 0, Math.PI * 2); ctx.fill(); ctx.fillRect(48, 70, 32, 40);
+    } else if (type === "gun1") {
+        ctx.fillRect(30, 45, 65, 20); ctx.fillRect(70, 60, 20, 35);
+    } else if (type === "gun2") {
+        ctx.fillRect(15, 50, 95, 15); ctx.fillRect(75, 60, 18, 30); ctx.fillRect(40, 60, 10, 15);
+    } else if (type === "gun3") {
+        ctx.fillRect(20, 40, 85, 25); ctx.fillRect(65, 60, 22, 35); ctx.fillRect(25, 60, 20, 10);
+    }
+    return cvs.toDataURL("image/png");
+}
+
+const canvas = document.getElementById("renderCanvas");
+const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true, antialias: false });
+engine.setHardwareScalingLevel(1 / GAME_CONFIG.qualityLevel); 
+
+const createScene = async function () {
+    const scene = new BABYLON.Scene(engine);
+    scene.skipPointerMovePicking = true;
+
+    let currentTargetMeshName = "None";
+    const managedDynamicMeshes = [];
+
+    scene.clearColor = new BABYLON.Color4(0.02, 0.1, 0.3, 1.0); 
+    const envTex = BABYLON.CubeTexture.CreateFromPrefilteredData("https://playground.babylonjs.com/textures/environment.dds", scene);
+    scene.environmentTexture = envTex;
+
+    const camera = new BABYLON.UniversalCamera("camera", new BABYLON.Vector3(0, 3, -15), scene);
+    camera.minZ = 0.1;
+    camera.maxZ = GAME_CONFIG.renderDistance + 10;
+    scene.gravity = new BABYLON.Vector3(0, GAME_CONFIG.gravityY * 0.04, 0); 
+    scene.collisionsEnabled = true;
+    camera.checkCollisions = true;
+    camera.applyGravity = true;
+    camera.ellipsoid = new BABYLON.Vector3(1, 1.5, 1); 
+
+    let targetPitch = 0; let targetYaw = 0; camera.rotation.set(0, 0, 0);
+    let lastJumpTime = 0;
+    
+    const pipeline = new BABYLON.DefaultRenderingPipeline("defaultPipeline", true, scene, [camera]);
+    pipeline.samples = 1; 
+    pipeline.imageProcessingEnabled = true;
+    pipeline.imageProcessing.contrast = 1.2;
+    pipeline.imageProcessing.exposure = 1.1;
+
+    const dirLight = new BABYLON.DirectionalLight("dirLight", new BABYLON.Vector3(-1, -2, -1), scene);
+    dirLight.position = new BABYLON.Vector3(20, 40, 20);
+    dirLight.intensity = 2.0;
+    const shadowGenerator = new BABYLON.ShadowGenerator(1024, dirLight);
+    shadowGenerator.useBlurExponentialShadowMap = true;
+    shadowGenerator.blurKernel = 16;
+
+    const havokInstance = await HavokPhysics({ locateFile: (path) => `https://cdn.babylonjs.com/havok/${path}` });
+    const hk = new BABYLON.HavokPlugin(true, havokInstance);
+    scene.enablePhysics(new BABYLON.Vector3(0, GAME_CONFIG.gravityY, 0), hk);
+
+    const yellowPBR = new BABYLON.PBRMaterial("yellowPBR", scene);
+    yellowPBR.albedoColor = new BABYLON.Color3(1, 0.8, 0.05); 
+    yellowPBR.metallic = 0.2; yellowPBR.roughness = 0.3;
+
+    const ground = BABYLON.MeshBuilder.CreateGround("ground", {width: 60, height: 60}, scene);
+    const groundPBR = new BABYLON.PBRMaterial("groundPBR", scene);
+    const dt = new BABYLON.DynamicTexture("dt", {width: 1024, height: 1024}, scene);
+    const ctx = dt.getContext();
+    ctx.fillStyle = "#1a1a1a"; ctx.fillRect(0, 0, 1024, 1024);
+    ctx.strokeStyle = "#ffa500"; ctx.lineWidth = 6;
+    for(let i = 0; i <= 1024; i += 64) {
+        ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, 1024); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(1024, i); ctx.stroke();
+    }
+    dt.update();
+    groundPBR.albedoTexture = dt; groundPBR.metallic = 0.1; groundPBR.roughness = 0.8;
+    ground.material = groundPBR; ground.receiveShadows = true; ground.checkCollisions = true; 
+    new BABYLON.PhysicsAggregate(ground, BABYLON.PhysicsShapeType.BOX, { mass: 0 }, scene);
+
+    const registerDynamicMesh = (mesh, aggregate) => {
+        mesh.isVisible = false;
+        managedDynamicMeshes.push({ mesh, aggregate });
+    };
+
+    const initialMeshTransforms = new Map();
+
+    for (let i = 0; i < 8; i++) {
+        let step = BABYLON.MeshBuilder.CreateBox("step" + i, {width: 6, height: 0.5, depth: 1.5}, scene);
+        step.position = new BABYLON.Vector3(10, i * 0.5 + 0.25, i * 1.5);
+        step.material = yellowPBR; step.receiveShadows = true; step.checkCollisions = true;
+        shadowGenerator.addShadowCaster(step);
+        let agg = new BABYLON.PhysicsAggregate(step, BABYLON.PhysicsShapeType.BOX, { mass: 0 }, scene);
+        registerDynamicMesh(step, agg);
+        initialMeshTransforms.set(step.name, {
+            pos: step.position.clone(),
+            rot: step.rotationQuaternion ? step.rotationQuaternion.clone() : BABYLON.Quaternion.FromEulerVector(step.rotation)
+        });
+    }
+
+    for (let i = 0; i < 8; i++) {
+        let isCube = i % 2 === 0;
+        let mesh = isCube ? BABYLON.MeshBuilder.CreateBox("cube" + i, {size: 1.5}, scene) : BABYLON.MeshBuilder.CreateSphere("sphere" + i, {diameter: 1.5}, scene);
+        mesh.position = new BABYLON.Vector3(-8 + Math.random() * 16, 5 + i * 2, 5 + Math.random() * 5);
+        mesh.material = yellowPBR; mesh.receiveShadows = true; mesh.checkCollisions = true;
+        shadowGenerator.addShadowCaster(mesh);
+        let agg = new BABYLON.PhysicsAggregate(mesh, isCube ? BABYLON.PhysicsShapeType.BOX : BABYLON.PhysicsShapeType.SPHERE, { mass: 1, restitution: 0.6, friction: 0.5 }, scene);
+        registerDynamicMesh(mesh, agg);
+        initialMeshTransforms.set(mesh.name, {
+            pos: mesh.position.clone(),
+            rot: mesh.rotationQuaternion ? mesh.rotationQuaternion.clone() : BABYLON.Quaternion.FromEulerVector(mesh.rotation)
+        });
+    }
+
+    const restoreMeshStates = () => {
+        const saved = localStorage.getItem(STORAGE_KEY_MESHES);
+        if (!saved) return;
+        try {
+            const data = JSON.parse(saved);
+            managedDynamicMeshes.forEach(item => {
+                const state = data[item.mesh.name];
+                if (state) {
+                    item.mesh.position.set(state.pos.x, state.pos.y, state.pos.z);
+                    if (!item.mesh.rotationQuaternion) item.mesh.rotationQuaternion = new BABYLON.Quaternion();
+                    item.mesh.rotationQuaternion.set(state.rot.x, state.rot.y, state.rot.z, state.rot.w);
+                    if (item.aggregate && item.aggregate.body) {
+                        item.aggregate.body.setLinearVelocity(new BABYLON.Vector3(state.linVel.x, state.linVel.y, state.linVel.z));
+                        item.aggregate.body.setAngularVelocity(new BABYLON.Vector3(state.angVel.x, state.angVel.y, state.angVel.z));
+                    }
+                }
+            });
+        } catch (e) { console.error(e); }
+    };
+
+    restoreMeshStates();
+
+    // GUI SYSTEM & CONTROL REGISTRY
+    const adt = BABYLON.GUI.AdvancedDynamicTexture.CreateFullscreenUI("UI");
+    const darkBluePurple = "#3b2a5c"; 
+    const s = GAME_CONFIG.guiScale;
+
+    const editableControls = [];
+    const initialGuiTransforms = new Map();
+
+    const parsePx = (v) => typeof v === "number" ? v : (parseFloat(v) || 0);
+
+    // Forward declaration for weapon scaling callback
+    let updateWeaponBoxContentScale = (newWidth) => {};
+
+    const updateControlShape = (control, isSquare, val) => {
+        control.width = val + "px";
+        if (isSquare) {
+            control.height = val + "px";
+            control.cornerRadius = val / 2;
+        }
+        if (control.name === "weaponBox") {
+            updateWeaponBoxContentScale(val);
+        }
+    };
+
+    const registerEditableControl = (id, name, control, isSquare = true, baseRatio = 1, minSize = 40, maxSize = 600) => {
+        const defaultThickness = control.thickness !== undefined ? control.thickness : 0;
+        const defaultColor = control.color || "white";
+        editableControls.push({ id, name, control, isSquare, baseRatio, minSize, maxSize, defaultThickness, defaultColor });
+        initialGuiTransforms.set(id, {
+            left: parsePx(control.left),
+            top: parsePx(control.top),
+            width: parsePx(control.width),
+            height: parsePx(control.height)
+        });
+    };
+
+    // Selection Outline helper
+    const applyEditHighlight = (selectedItem) => {
+        editableControls.forEach(item => {
+            item.control.thickness = item.defaultThickness;
+            item.control.color = item.defaultColor;
+        });
+        if (selectedItem) {
+            selectedItem.control.thickness = 5;
+            selectedItem.control.color = "red";
+        }
+    };
+
+    // Touch Look Controls
+    let activeLookPointerId = null, lastTouchX = 0, lastTouchY = 0;
+    let isEditMode = false;
+
+    window.addEventListener("pointerdown", (evt) => {
+        if (evt.target !== canvas || isEditMode) return;
+        if (activeLookPointerId === null && evt.clientX > window.innerWidth * 0.3) {
+            activeLookPointerId = evt.pointerId;
+            lastTouchX = evt.clientX; lastTouchY = evt.clientY;
+        }
+    });
+
+    window.addEventListener("pointermove", (evt) => {
+        if (evt.pointerId === activeLookPointerId && !isEditMode) {
+            const actualSens = (GAME_CONFIG.lookSensitivityUser / 10000);
+            targetYaw += (evt.clientX - lastTouchX) * actualSens;
+            targetPitch += (evt.clientY - lastTouchY) * actualSens;
+            lastTouchX = evt.clientX; lastTouchY = evt.clientY;
+        }
+    });
+
+    const clearLookPointer = (evt) => { if (evt.pointerId === activeLookPointerId) activeLookPointerId = null; };
+    window.addEventListener("pointerup", clearLookPointer);
+    window.addEventListener("pointercancel", clearLookPointer);
+
+    // Health Bar
+    let healthBg = new BABYLON.GUI.Rectangle("healthBg");
+    healthBg.width = (250 * s) + "px"; healthBg.height = (20 * s) + "px"; healthBg.background = "red"; healthBg.thickness = 0;
+    healthBg.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+    healthBg.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+    healthBg.left = (20 * s) + "px"; healthBg.top = (20 * s) + "px"; healthBg.cornerRadius = 10 * s;
+    adt.addControl(healthBg);
+    registerEditableControl("healthBg", "Health Bar", healthBg, false, 60 / 450, 100, 800);
+
+    let clampedHealth = Math.min(100, Math.max(0, GAME_CONFIG.healthPercentage));
+    let healthFg = new BABYLON.GUI.Rectangle("healthFg");
+    healthFg.width = (clampedHealth) + "%"; healthFg.height = "100%"; healthFg.background = "#00FF00"; healthFg.thickness = 0;
+    healthFg.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT; healthFg.cornerRadius = 10 * s;
+    healthBg.addControl(healthFg);
+
+    // Top Header Controls
+    let topHeaderPanel = new BABYLON.GUI.StackPanel("topHeaderPanel");
+    topHeaderPanel.isVertical = false; 
+    topHeaderPanel.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT;
+    topHeaderPanel.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+    topHeaderPanel.top = (15 * s) + "px";
+    topHeaderPanel.left = (-15 * s) + "px";
+    topHeaderPanel.height = (50 * s) + "px";
+    adt.addControl(topHeaderPanel);
+    
+    let createSimpleBtn = (txt, w) => {
+        let b = BABYLON.GUI.Button.CreateSimpleButton("btn_" + txt, txt);
+        b.width = (w * s) + "px"; b.height = (45 * s) + "px"; b.color = "white"; b.background = darkBluePurple; b.cornerRadius = 10 * s;
+        b.children[0].fontSize = Math.round(18 * s);
+        return b;
+    };
+
+    let fsBtn = createSimpleBtn("Fullscreen", 120);
+    fsBtn.onPointerUpObservable.add(() => {
+        if (!document.fullscreenElement) document.documentElement.requestFullscreen().catch(err => console.log(err));
+        else document.exitFullscreen().catch(err => console.log(err));
+    });
+    topHeaderPanel.addControl(fsBtn);
+
+    let backBtn = createSimpleBtn("Back", 80);
+    backBtn.paddingLeft = (10 * s) + "px";
+    topHeaderPanel.addControl(backBtn);
+
+    let setBtn = createSimpleBtn("Settings", 100); 
+    setBtn.paddingLeft = (10 * s) + "px"; 
+    topHeaderPanel.addControl(setBtn);
+
+    // Info Panel
+    let infoPanel = new BABYLON.GUI.StackPanel("infoPanel");
+    infoPanel.isVertical = false;
+    infoPanel.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT;
+    infoPanel.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+    infoPanel.top = (70 * s) + "px";
+    infoPanel.left = (-15 * s) + "px";
+    infoPanel.height = (30 * s) + "px";
+    adt.addControl(infoPanel);
+
+    let fpsText = new BABYLON.GUI.TextBlock("fpsText");
+    fpsText.width = (90 * s) + "px"; fpsText.height = (30 * s) + "px"; fpsText.color = "white";
+    fpsText.fontSize = Math.round(16 * s); fpsText.text = "FPS: 60";
+    fpsText.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT;
+    infoPanel.addControl(fpsText);
+
+    let targetText = new BABYLON.GUI.TextBlock("targetText");
+    targetText.width = (220 * s) + "px"; targetText.height = (30 * s) + "px"; targetText.color = "#00FF00";
+    targetText.fontSize = Math.round(16 * s); targetText.text = "Target: None";
+    targetText.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT;
+    targetText.paddingLeft = (10 * s) + "px";
+    infoPanel.addControl(targetText);
+
+    // Movement Joystick Zone
+    let moveZone = new BABYLON.GUI.Rectangle();
+    moveZone.width = "40%"; moveZone.height = "60%"; moveZone.thickness = 0;
+    moveZone.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+    moveZone.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+    moveZone.isPointerBlocker = true;
+    adt.addControl(moveZone);
+
+    let moveOuter = new BABYLON.GUI.Ellipse(); moveOuter.width = (100 * s) + "px"; moveOuter.height = (100 * s) + "px";
+    moveOuter.color = darkBluePurple; moveOuter.thickness = 4 * s; moveOuter.background = "rgba(128,128,128,0.5)"; moveOuter.isVisible = false;
+    adt.addControl(moveOuter);
+    let moveInner = new BABYLON.GUI.Ellipse(); moveInner.width = (80 * s) + "px"; moveInner.height = (80 * s) + "px";
+    moveInner.color = "white"; moveInner.background = darkBluePurple; moveInner.isVisible = false;
+    adt.addControl(moveInner);
+
+    let isMoving = false, moveId = null, moveVec = BABYLON.Vector2.Zero(), msX = 0, msY = 0;
+    moveZone.onPointerDownObservable.add((c, e) => {
+        if (isEditMode) return;
+        isMoving = true; moveId = e.pointerId; msX = c.x; msY = c.y;
+        moveOuter.left = msX - canvas.width/2; moveOuter.top = msY - canvas.height/2; moveOuter.isVisible = true;
+        moveInner.left = moveOuter.left; moveInner.top = moveOuter.top; moveInner.isVisible = true;
+    });
+    moveZone.onPointerMoveObservable.add((c, e) => {
+        if(isMoving && moveId === e.pointerId && !isEditMode) {
+            let dx = c.x - msX, dy = c.y - msY, dist = Math.sqrt(dx*dx + dy*dy), maxDist = 75 * s;
+            if(dist > maxDist) { dx = (dx/dist)*maxDist; dy = (dy/dist)*maxDist; }
+            moveInner.left = (msX - canvas.width/2) + dx; moveInner.top = (msY - canvas.height/2) + dy;
+            moveVec.x = dx/maxDist; moveVec.y = dy/maxDist;
+        }
+    });
+    moveZone.onPointerUpObservable.add((c, e) => {
+        if(moveId === e.pointerId) { isMoving = false; moveId = null; moveOuter.isVisible = false; moveInner.isVisible = false; moveVec.scaleInPlace(0); }
+    });
+
+    // Action Buttons
+    let createActBtn = (id, label, txt, leftOffset, rightOffset, topOffset) => {
+        let b = BABYLON.GUI.Button.CreateSimpleButton(id, txt);
+        b.width = (90 * s) + "px"; b.height = (90 * s) + "px"; b.color = "white"; b.cornerRadius = 45 * s; 
+        b.background = darkBluePurple; b.thickness = 3 * s; b.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+        b.children[0].fontSize = Math.round(24 * s);
+        if(leftOffset !== null) { b.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT; b.left = (leftOffset * s) + "px"; }
+        if(rightOffset !== null) { b.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT; b.left = (rightOffset * s) + "px"; }
+        b.top = (topOffset * s) + "px";
+        adt.addControl(b);
+        registerEditableControl(id, label, b, true, 1, 40, 250);
+        return b;
+    };
+    createActBtn("actA1", "Button A1", "A1", 30, null, -120);
+    createActBtn("actA2", "Button A2", "A2", 30, null, -220);
+    createActBtn("actA3", "Button A3", "A3", null, -260, -50);
+    createActBtn("actA4", "Button A4", "A4", null, -360, -50);
+
+    // Shoot Joystick
+    let shootBase = new BABYLON.GUI.Ellipse("shootBase");
+    shootBase.width = (180 * s) + "px"; shootBase.height = (180 * s) + "px";
+    shootBase.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT;
+    shootBase.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+    shootBase.left = (-60 * s) + "px"; shootBase.top = (-60 * s) + "px";
+    shootBase.color = darkBluePurple; shootBase.thickness = 4 * s; shootBase.background = "rgba(128,128,128,0.5)";
+    shootBase.isPointerBlocker = true;
+    adt.addControl(shootBase);
+    registerEditableControl("shootBase", "Shoot Joystick", shootBase, true, 1, 60, 400);
+
+    let shootInner = new BABYLON.GUI.Ellipse();
+    shootInner.width = (110 * s) + "px"; shootInner.height = (110 * s) + "px"; 
+    shootInner.color = "white"; shootInner.thickness = 2 * s; shootInner.background = darkBluePurple;
+    shootBase.addControl(shootInner); 
+
+    let thumbImage = new BABYLON.GUI.Image("thumbImg", createFallbackIconDataURL("hand"));
+    shootInner.addControl(thumbImage);
+
+    let isShooting = false, shootId = null, shootVec = BABYLON.Vector2.Zero();
+
+    shootBase.onPointerDownObservable.add((c, e) => {
+        if (isEditMode) return;
+        isShooting = true; shootId = e.pointerId;
+        let dx = c.x - shootBase.centerX, dy = c.y - shootBase.centerY, dist = Math.sqrt(dx*dx + dy*dy), maxDist = 35 * s;
+        if(dist > maxDist) { dx = (dx/dist)*maxDist; dy = (dy/dist)*maxDist; }
+        shootInner.left = dx; shootInner.top = dy;
+        shootVec.x = dx / maxDist; shootVec.y = dy / maxDist;
+    });
+    shootBase.onPointerMoveObservable.add((c, e) => {
+        if(isShooting && shootId === e.pointerId && !isEditMode) {
+            let dx = c.x - shootBase.centerX, dy = c.y - shootBase.centerY, dist = Math.sqrt(dx*dx + dy*dy), maxDist = 35 * s;
+            if(dist > maxDist) { dx = (dx/dist)*maxDist; dy = (dy/dist)*maxDist; }
+            shootInner.left = dx; shootInner.top = dy;
+            shootVec.x = dx / maxDist; shootVec.y = dy / maxDist;
+        }
+    });
+    shootBase.onPointerUpObservable.add((c, e) => {
+        if(shootId === e.pointerId) { isShooting = false; shootId = null; shootInner.left = 0; shootInner.top = 0; shootVec.scaleInPlace(0); }
+    });
+
+    // Jump Button
+    let jumpBtn = BABYLON.GUI.Button.CreateSimpleButton("jumpBtn", "JUMP");
+    jumpBtn.width = (120 * s) + "px"; jumpBtn.height = (120 * s) + "px";
+    jumpBtn.color = "white"; jumpBtn.cornerRadius = 60 * s;
+    jumpBtn.background = darkBluePurple; jumpBtn.thickness = 3 * s;
+    jumpBtn.children[0].fontSize = Math.round(24 * s);
+    jumpBtn.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_RIGHT;
+    jumpBtn.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+    jumpBtn.left = (-100 * s) + "px"; jumpBtn.top = (-260 * s) + "px";
+    jumpBtn.isPointerBlocker = true;
+    adt.addControl(jumpBtn);
+    registerEditableControl("jumpBtn", "Jump Button", jumpBtn, true, 1, 50, 300);
+    
+    jumpBtn.onPointerDownObservable.add(() => {
+        if (isEditMode) return;
+        let now = performance.now();
+        let canJump = (camera._onGround || Math.abs(camera.cameraDirection.y) < 0.02) && (now - lastJumpTime > 400);
+        if (canJump) {
+            camera.cameraDirection.y = GAME_CONFIG.jumpHeight;
+            lastJumpTime = now;
+        }
+    });
+
+    // Weapon Selector Panel
+    let weaponBox = new BABYLON.GUI.Rectangle("weaponBox");
+    weaponBox.width = (550 * s*(3/4)) + "px"; weaponBox.height = (110 * s*(3/4)) + "px";
+    weaponBox.background = "grey"; weaponBox.color = "black"; weaponBox.thickness = 2 * s; weaponBox.cornerRadius = 12 * s;
+    weaponBox.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+    weaponBox.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_BOTTOM;
+    weaponBox.top = (-15 * s) + "px";
+    weaponBox.isPointerBlocker = true;
+    adt.addControl(weaponBox);
+    registerEditableControl("weaponBox", "Weapon Selector", weaponBox, false, 110 / 550, 200, 1000);
+
+    let gunPanel = new BABYLON.GUI.StackPanel();
+    gunPanel.isVertical = false; gunPanel.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+    weaponBox.addControl(gunPanel);
+
+    let weaponsData = [
+        { id: "gun1", name: "Gun 1", icon: createFallbackIconDataURL("gun1") },
+        { id: "gun2", name: "Gun 2", icon: createFallbackIconDataURL("gun2") },
+        { id: "gun3", name: "Gun 3", icon: createFallbackIconDataURL("gun3") },
+        { id: "hand", name: "Fist", icon: createFallbackIconDataURL("hand") }
+    ];
+
+    let activeWeapon = "hand";
+    let weaponButtons = [];
+    let weaponElementsRefs = [];
+
+    weaponsData.forEach((w, index) => {
+        let btn = BABYLON.GUI.Button.CreateSimpleButton(w.id, "");
+        btn.width = (120*(3/4) * s) + "px"; btn.height = (90 *(3/4)* s) + "px"; 
+        btn.background = darkBluePurple; btn.color = darkBluePurple; btn.thickness = 3 * s; btn.cornerRadius = 10 * s;
+        if(index > 0) btn.paddingLeft = (8 * s) + "px";
+        
+        let stack = new BABYLON.GUI.StackPanel(); stack.isVertical = true;
+        btn.addControl(stack);
+
+        let img = new BABYLON.GUI.Image(w.id+"_img", w.icon);
+        img.width = (100 * s) + "px"; img.height = (50 * s) + "px"; img.paddingTop = (5 * s) + "px";
+        stack.addControl(img);
+
+        let txt = new BABYLON.GUI.TextBlock(w.id+"_txt", w.name);
+        txt.height = (25 * s) + "px"; txt.color = "white"; txt.fontSize = Math.round(16 * s);
+        stack.addControl(txt);
+
+        if (w.id === activeWeapon) btn.color = "#00FF00"; 
+
+        btn.onPointerUpObservable.add(() => {
+            if (isEditMode) return;
+            activeWeapon = w.id;
+            thumbImage.source = w.icon; 
+            weaponButtons.forEach(b => b.color = darkBluePurple); 
+            btn.color = "#00FF00"; 
+        });
+        weaponButtons.push(btn);
+        weaponElementsRefs.push({ btn, img, txt, index });
+        gunPanel.addControl(btn);
+    });
+
+    // Scaler logic for scaling weapon items proportionally when panel resizes
+    updateWeaponBoxContentScale = (newWidth) => {
+        const scaleRatio = newWidth / 550;
+        weaponElementsRefs.forEach(ref => {
+            ref.btn.width = Math.round(120 * scaleRatio) + "px";
+            ref.btn.height = Math.round(90 * scaleRatio) + "px";
+            ref.btn.cornerRadius = Math.round(10 * scaleRatio);
+            if (ref.index > 0) ref.btn.paddingLeft = Math.round(8 * scaleRatio) + "px";
+            ref.img.width = Math.round(100 * scaleRatio) + "px";
+            ref.img.height = Math.round(50 * scaleRatio) + "px";
+            ref.txt.height = Math.round(25 * scaleRatio) + "px";
+            ref.txt.fontSize = Math.max(10, Math.round(16 * scaleRatio));
+        });
+    };
+
+    // Crosshair
+    let crosshair = new BABYLON.GUI.Ellipse();
+    crosshair.width = (8 * s) + "px"; crosshair.height = (8 * s) + "px"; crosshair.color = "white"; crosshair.background = "white";
+    adt.addControl(crosshair);
+
+    // Storage Functions
+    const saveSettings = () => {
+        const guiData = {};
+        editableControls.forEach(item => {
+            guiData[item.id] = {
+                left: parsePx(item.control.left),
+                top: parsePx(item.control.top),
+                width: parsePx(item.control.width),
+                height: parsePx(item.control.height)
+            };
+        });
+        localStorage.setItem(STORAGE_KEY_SETTINGS, JSON.stringify({
+            lookSensitivityUser: GAME_CONFIG.lookSensitivityUser,
+            gui: guiData
+        }));
+    };
+
+    const restoreSettings = () => {
+        const saved = localStorage.getItem(STORAGE_KEY_SETTINGS);
+        if (!saved) return;
+        try {
+            const data = JSON.parse(saved);
+            if (data.lookSensitivityUser !== undefined) {
+                GAME_CONFIG.lookSensitivityUser = data.lookSensitivityUser;
+                if (sensitivitySlider) sensitivitySlider.value = data.lookSensitivityUser;
+            }
+            if (data.gui) {
+                editableControls.forEach(item => {
+                    if (data.gui[item.id]) {
+                        let w = data.gui[item.id].width;
+                        item.control.left = data.gui[item.id].left + "px";
+                        item.control.top = data.gui[item.id].top + "px";
+                        updateControlShape(item.control, item.isSquare, w);
+                        if (!item.isSquare) {
+                            item.control.height = data.gui[item.id].height + "px";
+                        }
+                    }
+                });
+            }
+        } catch (e) { console.error(e); }
+    };
+
+    const resetGuiPreferences = () => {
+        localStorage.removeItem(STORAGE_KEY_SETTINGS);
+        GAME_CONFIG.lookSensitivityUser = 40;
+        if (sensitivitySlider) sensitivitySlider.value = 40;
+
+        initialGuiTransforms.forEach((val, id) => {
+            const found = editableControls.find(item => item.id === id);
+            if (found) {
+                found.control.left = val.left + "px";
+                found.control.top = val.top + "px";
+                updateControlShape(found.control, found.isSquare, val.width);
+                if (!found.isSquare) {
+                    found.control.height = val.height + "px";
+                }
+            }
+        });
+    };
+
+    // SETTINGS & EDIT MODE INTERFACES
+    const settingsPanel = new BABYLON.GUI.Rectangle("settingsPanel");
+    settingsPanel.width = "400px"; settingsPanel.height = "300px"; settingsPanel.background = "rgba(20, 20, 35, 0.95)";
+    settingsPanel.color = darkBluePurple; settingsPanel.thickness = 3; settingsPanel.cornerRadius = 15;
+    settingsPanel.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+    settingsPanel.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+    settingsPanel.top = "20px"; settingsPanel.isVisible = false; settingsPanel.isPointerBlocker = true;
+    adt.addControl(settingsPanel);
+
+    const settingsLayout = new BABYLON.GUI.StackPanel();
+    settingsLayout.isVertical = true; settingsLayout.paddingInPixels = 15;
+    settingsPanel.addControl(settingsLayout);
+
+    const settingsHeader = new BABYLON.GUI.TextBlock();
+    settingsHeader.text = "SETTINGS"; settingsHeader.color = "white"; settingsHeader.height = "30px"; settingsHeader.fontSize = 20;
+    settingsLayout.addControl(settingsHeader);
+
+    const sensHeader = new BABYLON.GUI.TextBlock();
+    sensHeader.text = "Camera Sensitivity: " + Math.round(GAME_CONFIG.lookSensitivityUser);
+    sensHeader.color = "#00FF00"; sensHeader.height = "25px"; sensHeader.fontSize = 14;
+    sensHeader.textHorizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_LEFT;
+    settingsLayout.addControl(sensHeader);
+
+    let sensitivitySlider = new BABYLON.GUI.Slider();
+    sensitivitySlider.minimum = 1; sensitivitySlider.maximum = 100; sensitivitySlider.value = GAME_CONFIG.lookSensitivityUser;
+    sensitivitySlider.height = "25px"; sensitivitySlider.width = "100%"; sensitivitySlider.color = "#00FF00"; sensitivitySlider.background = "grey";
+    sensitivitySlider.onValueChangedObservable.add((val) => {
+        GAME_CONFIG.lookSensitivityUser = val;
+        sensHeader.text = "Camera Sensitivity: " + Math.round(val);
+    });
+    settingsLayout.addControl(sensitivitySlider);
+
+    // Red Buttons Row - EXPLICITLY CENTERED
+    const layoutRowContainer = new BABYLON.GUI.Rectangle();
+    layoutRowContainer.width = "100%";
+    layoutRowContainer.height = "50px";
+    layoutRowContainer.thickness = 0;
+    settingsLayout.addControl(layoutRowContainer);
+
+    const layoutRow = new BABYLON.GUI.StackPanel();
+    layoutRow.isVertical = false; 
+    layoutRow.width = "330px";
+    layoutRow.height = "50px"; 
+    layoutRow.paddingTopInPixels = 10;
+    layoutRow.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+    layoutRowContainer.addControl(layoutRow);
+
+    const editUiBtn = BABYLON.GUI.Button.CreateSimpleButton("editUiBtn", "CHANGE LAYOUT");
+    editUiBtn.width = "150px"; editUiBtn.height = "38px"; editUiBtn.color = "white"; editUiBtn.background = "#dc3545"; editUiBtn.cornerRadius = 8;
+    editUiBtn.children[0].fontSize = 12;
+    layoutRow.addControl(editUiBtn);
+
+    const resetLayoutBtn = BABYLON.GUI.Button.CreateSimpleButton("resetLayoutBtn", "RESET LAYOUT");
+    resetLayoutBtn.width = "150px"; resetLayoutBtn.height = "38px"; resetLayoutBtn.color = "white"; resetLayoutBtn.background = "#dc3545"; resetLayoutBtn.cornerRadius = 8;
+    resetLayoutBtn.paddingLeftInPixels = 10;
+    resetLayoutBtn.children[0].fontSize = 12;
+    layoutRow.addControl(resetLayoutBtn);
+
+    resetLayoutBtn.onPointerUpObservable.add(() => {
+        resetGuiPreferences();
+    });
+
+    const closeSettingsBtn = BABYLON.GUI.Button.CreateSimpleButton("closeSettingsBtn", "Close Settings");
+    closeSettingsBtn.width = "100%"; closeSettingsBtn.height = "42px"; closeSettingsBtn.color = "white"; closeSettingsBtn.background = darkBluePurple; closeSettingsBtn.cornerRadius = 8;
+    closeSettingsBtn.paddingTopInPixels = 10;
+    settingsLayout.addControl(closeSettingsBtn);
+
+    // Floating Customization Bar
+    const editToolPanel = new BABYLON.GUI.Rectangle("editToolPanel");
+    editToolPanel.width = "620px"; editToolPanel.height = "160px";
+    editToolPanel.background = "rgba(15, 15, 25, 0.95)"; editToolPanel.color = "yellow"; editToolPanel.thickness = 2; editToolPanel.cornerRadius = 10;
+    editToolPanel.horizontalAlignment = BABYLON.GUI.Control.HORIZONTAL_ALIGNMENT_CENTER;
+    editToolPanel.verticalAlignment = BABYLON.GUI.Control.VERTICAL_ALIGNMENT_TOP;
+    editToolPanel.top = "15px"; editToolPanel.isVisible = false; editToolPanel.isPointerBlocker = true;
+    adt.addControl(editToolPanel);
+
+    const editToolLayout = new BABYLON.GUI.StackPanel();
+    editToolLayout.isVertical = true; editToolLayout.paddingInPixels = 8;
+    editToolPanel.addControl(editToolLayout);
+
+    const selectedLabel = new BABYLON.GUI.TextBlock();
+    selectedLabel.text = "Click any button to customize it"; selectedLabel.color = "yellow"; selectedLabel.height = "30px"; selectedLabel.fontSize = 20;
+    editToolLayout.addControl(selectedLabel);
+
+    // Range Slider
+    const sliderRow = new BABYLON.GUI.StackPanel();
+    sliderRow.isVertical = false; sliderRow.height = "30px"; sliderRow.paddingTopInPixels = 2;
+    editToolLayout.addControl(sliderRow);
+
+    const sliderLbl = new BABYLON.GUI.TextBlock();
+    sliderLbl.text = "Size:"; sliderLbl.color = "white"; sliderLbl.width = "50px"; sliderLbl.fontSize = 13;
+    sliderRow.addControl(sliderLbl);
+
+    const sizeSlider = new BABYLON.GUI.Slider();
+    sizeSlider.minimum = 40; sizeSlider.maximum = 1000; sizeSlider.height = "20px"; sizeSlider.width = "500px";
+    sizeSlider.color = "#00FF00"; sizeSlider.background = "grey";
+    sliderRow.addControl(sizeSlider);
+
+    // Coordinates Row
+    const inputsRow = new BABYLON.GUI.StackPanel();
+    inputsRow.isVertical = false; inputsRow.height = "45px"; inputsRow.paddingTopInPixels = 4;
+    editToolLayout.addControl(inputsRow);
+
+    const createHoldableCoordinateControl = (lblTxt) => {
+        const container = new BABYLON.GUI.StackPanel();
+        container.isVertical = false; container.width = "280px";
+
+        const lbl = new BABYLON.GUI.TextBlock();
+        lbl.text = lblTxt; lbl.color = "white"; lbl.width = "60px"; lbl.fontSize = 14;
+        container.addControl(lbl);
+
+        const minusBtn = BABYLON.GUI.Button.CreateSimpleButton("btnMinus_" + lblTxt, "-");
+        minusBtn.width = "40px"; minusBtn.height = "40px"; minusBtn.color = "white"; minusBtn.background = darkBluePurple; minusBtn.cornerRadius = 6;
+        minusBtn.children[0].fontSize = 20;
+        container.addControl(minusBtn);
+
+        const valDisplay = new BABYLON.GUI.TextBlock();
+        valDisplay.text = "0"; valDisplay.color = "white"; valDisplay.width = "60px"; valDisplay.fontSize = 14;
+        container.addControl(valDisplay);
+
+        const plusBtn = BABYLON.GUI.Button.CreateSimpleButton("btnPlus_" + lblTxt, "+");
+        plusBtn.width = "40px"; plusBtn.height = "40px"; plusBtn.color = "white"; plusBtn.background = darkBluePurple; plusBtn.cornerRadius = 6;
+        plusBtn.children[0].fontSize = 20;
+        container.addControl(plusBtn);
+
+        let holdInterval = null;
+
+        const adjustVal = (delta) => {
+            if (activeSelectedControl) {
+                let cur = parsePx(lblTxt.includes("X") ? activeSelectedControl.control.left : activeSelectedControl.control.top);
+                let updated = cur + delta;
+                if (lblTxt.includes("X")) {
+                    activeSelectedControl.control.left = updated + "px";
+                } else {
+                    activeSelectedControl.control.top = updated + "px";
+                }
+                valDisplay.text = String(updated);
+            }
+        };
+
+        const startHold = (delta) => {
+            adjustVal(delta);
+            clearInterval(holdInterval);
+            holdInterval = setInterval(() => adjustVal(delta), 50);
+        };
+
+        const stopHold = () => { clearInterval(holdInterval); };
+
+        minusBtn.onPointerDownObservable.add(() => startHold(-1));
+        minusBtn.onPointerUpObservable.add(stopHold);
+        minusBtn.onPointerOutObservable.add(stopHold);
+
+        plusBtn.onPointerDownObservable.add(() => startHold(1));
+        plusBtn.onPointerUpObservable.add(stopHold);
+        plusBtn.onPointerOutObservable.add(stopHold);
+
+        return { container, valDisplay };
+    };
+
+    let posXCtrl = createHoldableCoordinateControl("X (px):");
+    let posYCtrl = createHoldableCoordinateControl("Y (px):");
+
+    inputsRow.addControl(posXCtrl.container);
+    inputsRow.addControl(posYCtrl.container);
+
+    const editActionsRow = new BABYLON.GUI.StackPanel();
+    editActionsRow.isVertical = false; editActionsRow.height = "32px"; editActionsRow.paddingTopInPixels = 4;
+    editToolLayout.addControl(editActionsRow);
+
+    const saveUiBtn = BABYLON.GUI.Button.CreateSimpleButton("saveUiBtn", "Save");
+    saveUiBtn.width = "110px"; saveUiBtn.height = "26px"; saveUiBtn.color = "white"; saveUiBtn.background = "#28a745"; saveUiBtn.cornerRadius = 6;
+    editActionsRow.addControl(saveUiBtn);
+
+    const cancelUiBtn = BABYLON.GUI.Button.CreateSimpleButton("cancelUiBtn", "Cancel");
+    cancelUiBtn.width = "110px"; cancelUiBtn.height = "26px"; cancelUiBtn.color = "white"; cancelUiBtn.background = "#dc3545"; cancelUiBtn.cornerRadius = 6;
+    cancelUiBtn.paddingLeftInPixels = 10;
+    editActionsRow.addControl(cancelUiBtn);
+
+    let activeSelectedControl = null;
+    let tempControlState = null;
+    let isSliderUpdating = false;
+
+    const selectControlForEdit = (item) => {
+        activeSelectedControl = item;
+        tempControlState = {
+            left: item.control.left,
+            top: item.control.top,
+            width: item.control.width,
+            height: item.control.height
+        };
+
+        applyEditHighlight(item);
+
+        selectedLabel.text = "Editing: " + item.name;
+        isSliderUpdating = true;
+        sizeSlider.minimum = item.minSize;
+        sizeSlider.maximum = item.maxSize;
+        sizeSlider.value = parsePx(item.control.width);
+        isSliderUpdating = false;
+        posXCtrl.valDisplay.text = String(parsePx(item.control.left));
+        posYCtrl.valDisplay.text = String(parsePx(item.control.top));
+    };
+
+    editableControls.forEach(item => {
+        item.control.onPointerDownObservable.add(() => {
+            if (isEditMode) {
+                selectControlForEdit(item);
+            }
+        });
+    });
+
+    weaponButtons.forEach(btn => {
+        btn.onPointerDownObservable.add(() => {
+            if (isEditMode) {
+                const weaponControl = editableControls.find(i => i.id === "weaponBox");
+                if (weaponControl) selectControlForEdit(weaponControl);
+            }
+        });
+    });
+
+    sizeSlider.onValueChangedObservable.add((val) => {
+        if (activeSelectedControl && !isSliderUpdating) {
+            updateControlShape(activeSelectedControl.control, activeSelectedControl.isSquare, val);
+            if (!activeSelectedControl.isSquare) {
+                activeSelectedControl.control.height = (val * activeSelectedControl.baseRatio) + "px";
+            }
+        }
+    });
+
+    setBtn.onPointerUpObservable.add(() => {
+        if (!isEditMode) settingsPanel.isVisible = !settingsPanel.isVisible;
+    });
+
+    closeSettingsBtn.onPointerUpObservable.add(() => {
+        settingsPanel.isVisible = false;
+    });
+
+    editUiBtn.onPointerUpObservable.add(() => {
+        settingsPanel.isVisible = false;
+        editToolPanel.isVisible = true;
+        isEditMode = true;
+        selectControlForEdit(editableControls[0]);
+    });
+
+    const exitEditMode = () => {
+        editToolPanel.isVisible = false;
+        isEditMode = false;
+        activeSelectedControl = null;
+        applyEditHighlight(null);
+    };
+
+    saveUiBtn.onPointerUpObservable.add(() => {
+        saveSettings();
+        exitEditMode();
+    });
+
+    cancelUiBtn.onPointerUpObservable.add(() => {
+        if (activeSelectedControl && tempControlState) {
+            activeSelectedControl.control.left = tempControlState.left;
+            activeSelectedControl.control.top = tempControlState.top;
+            let oldW = parsePx(tempControlState.width);
+            updateControlShape(activeSelectedControl.control, activeSelectedControl.isSquare, oldW);
+            if (!activeSelectedControl.isSquare) {
+                activeSelectedControl.control.height = tempControlState.height;
+            }
+        }
+        restoreSettings();
+        exitEditMode();
+    });
+
+    restoreSettings();
+
+    // RENDER & PHYSICS UPDATE LOOP
+    scene.onBeforeRenderObservable.add(() => {
+        fpsText.text = "FPS: " + engine.getFps().toFixed(0);
+
+        const frustumPlanes = BABYLON.Frustum.GetPlanes(camera.getTransformationMatrix());
+        const camPos = camera.position;
+
+        managedDynamicMeshes.forEach(item => {
+            const mesh = item.mesh;
+            let dist = BABYLON.Vector3.Distance(camPos, mesh.position);
+            if (dist <= GAME_CONFIG.renderDistance) {
+                mesh.computeWorldMatrix(true);
+                mesh.isVisible = mesh.isInFrustum(frustumPlanes);
+            } else {
+                mesh.isVisible = false;
+            }
+        });
+
+        let aimRay = camera.getForwardRay(GAME_CONFIG.targetAimRange);
+        let aimHit = scene.pickWithRay(aimRay, (m) => m.isVisible);
+        if (aimHit && aimHit.hit && aimHit.pickedMesh) {
+            currentTargetMeshName = aimHit.pickedMesh.name;
+        } else {
+            currentTargetMeshName = "None";
+        }
+        targetText.text = "Target: " + currentTargetMeshName;
+
+        if (!isEditMode) {
+            targetPitch = Math.max(-Math.PI / 2 + 0.1, Math.min(Math.PI / 2 - 0.1, targetPitch));
+            camera.rotation.x = BABYLON.Scalar.Lerp(camera.rotation.x, targetPitch, 0.3);
+            camera.rotation.y = BABYLON.Scalar.Lerp(camera.rotation.y, targetYaw, 0.3);
+
+            if (isMoving) {
+                let forward = camera.getDirection(BABYLON.Vector3.Forward());
+                let right = camera.getDirection(BABYLON.Vector3.Right());
+                forward.y = 0; right.y = 0; 
+                forward.normalize(); right.normalize();
+                let move = forward.scale(-moveVec.y * GAME_CONFIG.moveSpeed).add(right.scale(moveVec.x * GAME_CONFIG.moveSpeed));
+                camera.cameraDirection.x = move.x;
+                camera.cameraDirection.z = move.z;
+            }
+
+            if (isShooting && activeWeapon === "hand") {
+                let ray = camera.getForwardRay(GAME_CONFIG.shootRange);
+                let hit = scene.pickWithRay(ray, (mesh) => mesh.physicsBody !== null);
+                if (hit && hit.hit && hit.pickedMesh && hit.pickedMesh.physicsBody) {
+                    let camForward = camera.getDirection(BABYLON.Vector3.Forward()).normalize();
+                    let camRight = camera.getDirection(BABYLON.Vector3.Right()).normalize();
+                    let camUp = camera.getDirection(BABYLON.Vector3.Up()).normalize();
+
+                    let pushDir = camForward.add(camRight.scale(shootVec.x)).add(camUp.scale(-shootVec.y)).normalize();
+                    hit.pickedMesh.physicsBody.applyImpulse(pushDir.scale(0.1), hit.pickedPoint);
+                }
+            }
+        }
+    });
+
+    return scene;
+};
+
+createScene().then(scene => {
+    engine.runRenderLoop(() => { scene.render(); });
+});
+window.addEventListener("resize", () => { engine.resize(); });
