@@ -23,7 +23,7 @@ A lightweight, high-performance 3D First-Person View (FPV) engine and customizab
 ## ⚡ Live Demo
 
 Try out the interactive prototype directly in your browser:
-* **Test Live:** [Launch Mobile FPV Demo](https://iodonium.github.io/Babylon-JS-mobile-FPV-prototype-/PROTOTYPEV4.html)
+* **Test Live:** [Launch Mobile FPV Demo](https://iodonium.github.io/Babylon-JS-mobile-FPV-prototype-/Main/)
 
 ---
 
